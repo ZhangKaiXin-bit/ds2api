@@ -3,7 +3,7 @@
 文档导航：[总览](../README.MD) / [架构说明](./ARCHITECTURE.md) / [接口文档](../API.md) / [测试指南](./TESTING.md)
 
 > 本文档是 DS2API“把 OpenAI / Claude / Gemini 风格 API 请求兼容成 DeepSeek 网页对话纯文本上下文”的专项说明。
-> 这是项目最重要的兼容产物之一。凡是修改消息标准化、tool prompt 注入、tool history 保留、文件引用、history split、下游 completion payload 组装等行为，都必须同步更新本文档。
+> 这是项目最重要的兼容产物之一。凡是修改消息标准化、tool prompt 注入、tool history 保留、文件引用、current input file / legacy history_split、下游 completion payload 组装等行为，都必须同步更新本文档。
 
 ## 1. 核心结论
 
@@ -45,7 +45,7 @@ DS2API 当前的核心思路，不是把客户端传来的 `messages`、`tools`�
   -> promptcompat 统一消息标准化
   -> tool prompt 注入
   -> DeepSeek 风格 prompt 拼装
-  -> 文件收集 / inline 上传 / history split（OpenAI 链路）
+  -> 文件收集 / inline 上传 / current input file（OpenAI 链路）
   -> completion payload
   -> 下游网页对话接口
 ```
@@ -107,12 +107,11 @@ DS2API 当前的核心思路，不是把客户端传来的 `messages`、`tools`�
 
 ## 5. prompt 是怎么拼出来的
 
-OpenAI Chat / Responses 在标准化后、history split / current input file 之前，会默认执行 `thinking_injection` 增强。它参考 DeepSeek V4 “把控制指令放在 user 消息末尾更稳定”的用法，在最新 user message 后追加思考增强提示词。当前内置默认提示词以 `Reasoning Effort: Absolute maximum with no shortcuts permitted.` 开头，并继续要求模型充分分解问题、覆盖潜在路径与边界条件、把完整推演过程显式写出。该开关默认启用，可通过 `thinking_injection.enabled=false` 关闭；也可以通过 `thinking_injection.prompt` 自定义提示词，留空时使用内置默认提示词。
+OpenAI Chat / Responses 在标准化后、current input file 之前，会默认执行 `thinking_injection` 增强。它参考 DeepSeek V4 “把控制指令放在 user 消息末尾更稳定”的用法，在最新 user message 后追加思考增强提示词。当前内置默认提示词以 `Reasoning Effort: Absolute maximum with no shortcuts permitted.` 开头，并继续要求模型充分分解问题、覆盖潜在路径与边界条件、把完整推演过程显式写出。该开关默认启用，可通过 `thinking_injection.enabled=false` 关闭；也可以通过 `thinking_injection.prompt` 自定义提示词，留空时使用内置默认提示词。
 
 这段增强属于 prompt 可见上下文：
 
 - 普通请求会直接出现在最终 `prompt` 的最新 user block 末尾。
-- 如果触发 `HISTORY.txt`，它会保留在 live context 的最新 user turn 中。
 - 如果触发 current input file，它会进入完整上下文文件中。
 
 ### 5.1 角色标记
@@ -153,6 +152,7 @@ OpenAI Chat / Responses 在标准化后、history split / current input file 之
 
 工具调用正例现在优先示范官方 DSML 风格：`<|DSML|tool_calls>` → `<|DSML|invoke name="...">` → `<|DSML|parameter name="...">`。
 兼容层仍接受旧式纯 `<tool_calls>` wrapper，但提示词会优先要求模型输出官方 DSML 标签，并强调不能只输出 closing wrapper 而漏掉 opening tag。需要注意：这是“兼容 DSML 外壳，内部仍以 XML 解析语义为准”，不是原生 DSML 全链路实现；DSML 标签会在解析入口归一化回现有 XML 标签后继续走同一套 parser。
+数组参数使用 `<item>...</item>` 子节点表示；当某个参数体只包含 item 子节点时，Go / Node 解析器会把它还原成数组，避免 `questions` / `options` 这类 schema 中要求 array 的参数被误解析成 `{ "item": ... }` 对象。若模型把完整结构化 XML fragment 误包进 CDATA，兼容层会在保护 `content` / `command` 等原文字段的前提下，尝试把非原文字段中的 CDATA XML fragment 还原成 object / array。不过，如果 CDATA 只是单个平面的 XML/HTML 标签，例如 `<b>urgent</b>` 这种行内标记，兼容层会保留原始字符串，不会强行升成 object / array；只有明显表示结构的 CDATA 片段，例如多兄弟节点、嵌套子节点或 `item` 列表，才会触发结构化恢复。
 正例中的工具名只会来自当前请求实际声明的工具；如果当前请求没有足够的已知工具形态，就省略对应的单工具、多工具或嵌套示例，避免把不可用工具名写进 prompt。
 对执行类工具，脚本内容必须进入执行参数本身：`Bash` / `execute_command` 使用 `command`，`exec_command` 使用 `cmd`；不要把脚本示范成 `path` / `content` 文件写入参数。
 
@@ -240,51 +240,22 @@ OpenAI 文件相关实现：
 
 ## 9. 多轮历史为什么不会一直完整内联在 prompt
 
-兼容层提供两种拆分策略：
+兼容层现在只保留 `current_input_file` 这一种拆分方式；旧的 `history_split` 已废弃，只保留为兼容旧配置的字段，不再参与请求处理。
 
-- `history_split` 是轮次拆分，默认关闭；开启后默认从第 2 个 user turn 起触发，可通过 `history_split.trigger_after_turns` 调整阈值。
-- `current_input_file` 是独立拆分，默认开启；它用于把“完整上下文”合并进隐藏上下文文件。当最新 user turn 的纯文本长度达到 `current_input_file.min_chars`（默认 `0`）时，兼容层会上传一个文件名为 `IGNORE.txt` 的上下文文件，并在 live prompt 中只保留一个中性的 user 消息要求模型直接回答最新请求，不再暴露文件名或要求模型读取本地文件。
-
-两个策略互斥，最多只能启用一个。如果两个开关都关闭，请求会直接透传，不上传 `HISTORY.txt` 或 current input file。
+- `current_input_file` 默认开启；它用于把“完整上下文”合并进隐藏上下文文件。当最新 user turn 的纯文本长度达到 `current_input_file.min_chars`（默认 `0`）时，兼容层会上传一个文件名为 `IGNORE.txt` 的上下文文件，并在 live prompt 中只保留一个中性的 user 消息要求模型直接回答最新请求，不再暴露文件名或要求模型读取本地文件。
+- 如果 `current_input_file.enabled=false`，请求会直接透传，不上传任何拆分上下文文件。
+- 旧的 `history_split.enabled` / `history_split.trigger_after_turns` 会被读取进配置对象以保持兼容，但不会触发拆分上传，也不会影响 `current_input_file` 的默认开启。
 
 相关实现：
 
 - 配置访问器：
   [internal/config/store_accessors.go](../internal/config/store_accessors.go)
-- 历史拆分：
-  [internal/httpapi/openai/history/history_split.go](../internal/httpapi/openai/history/history_split.go)
 - 当前输入转文件：
   [internal/httpapi/openai/history/current_input_file.go](../internal/httpapi/openai/history/current_input_file.go)
+- 旧历史拆分兼容壳：
+  [internal/httpapi/openai/history/history_split.go](../internal/httpapi/openai/history/history_split.go)
 
-history split 触发后行为：
-
-1. 旧历史消息被切出去。
-2. 旧历史会被重新序列化成一个文本文件。
-3. 真正上传的文件名固定是 `HISTORY.txt`。
-4. 文件内容内部会使用 `IGNORE` 这层包装名来闭合 DeepSeek 官网原生文件标记。
-5. 该文件上传后，其 `file_id` 会排在 `ref_file_ids` 最前面。
-6. live prompt 只保留：
-   - system / developer
-   - 最新 user turn 起的上下文
-
-历史文件内容不是普通自由文本，而是用同一套角色标记再次序列化出的 transcript：
-
-```text
-[uploaded filename]: HISTORY.txt
-[file content end]
-
-<｜begin▁of▁sentence｜><｜User｜>...<｜Assistant｜>...<｜Tool｜>...
-
-[file name]: IGNORE
-[file content begin]
-```
-
-所以“完整上下文”在当前实现里，其实通常分散在两处：
-
-- `prompt` 里的 live context
-- `ref_file_ids` 指向的 history transcript file
-
-当前输入转文件启用并触发时，不会同时启用 history split，也不会上传 `HISTORY.txt`。上传文件的真实文件名是 `IGNORE.txt`，文件内容是完整 `messages` 上下文；它仍会先用 OpenAI 消息标准化和 DeepSeek 角色标记序列化，再包进 `IGNORE` 文件边界里：
+当前输入转文件启用并触发时，上传文件的真实文件名是 `IGNORE.txt`，文件内容是完整 `messages` 上下文；它仍会先用 OpenAI 消息标准化和 DeepSeek 角色标记序列化，再包进 `IGNORE` 文件边界里：
 
 ```text
 [uploaded filename]: IGNORE.txt
@@ -308,7 +279,7 @@ history split 触发后行为：
 - Responses `instructions` 会 prepend 为 system message
 - `tools` 会注入 system prompt
 - `attachments` / `input_file` / inline 文件会进入 `ref_file_ids`
-- history split 主要在这条链路里生效
+- current input file 主要在这条链路里生效，旧 `history_split` 仅作兼容字段保留
 
 ### 10.2 Claude Messages
 
@@ -339,15 +310,15 @@ history split 触发后行为：
 - 有 tools
 - 有一个文件型 systemprompt 附件
 - 有历史 assistant tool call / tool result
-- history split 已触发
+- current input file 已触发
 
 那么最终上下文更接近：
 
 ```json
 {
-  "prompt": "<｜begin▁of▁sentence｜><｜System｜>原 system / developer\n\nYou have access to these tools: ...<｜end▁of▁instructions｜><｜User｜>最新问题<｜Assistant｜>",
+  "prompt": "<｜begin▁of▁sentence｜><｜System｜>原 system / developer\n\nYou have access to these tools: ...<｜end▁of▁instructions｜><｜User｜>The current request and prior conversation context have already been provided. Answer the latest user request directly.<｜Assistant｜>",
   "ref_file_ids": [
-    "file-history-ignore",
+    "file-current-input-ignore",
     "file-systemprompt",
     "file-other-attachment"
   ],
@@ -360,7 +331,7 @@ history split 触发后行为：
 
 - 大部分结构化语义被压进 `prompt`
 - 文件保持文件
-- 历史必要时拆文件
+- 需要时把完整上下文拆进隐藏上下文文件
 
 ## 12. 修改时必须同步本文档的场景
 
@@ -373,7 +344,8 @@ history split 触发后行为：
 - tool result 注入方式变更
 - tool prompt 模板或 tool_choice 约束变更
 - inline 文件上传 / 文件引用收集规则变更
-- history split 触发条件、上传格式、`IGNORE` 包装格式变更
+- current input file 触发条件、上传格式、`IGNORE` 包装格式变更
+- 旧 `history_split` 兼容逻辑的读取、忽略或退化行为变更
 - completion payload 字段语义变更
 - Claude / Gemini 对这套统一语义的复用关系变更
 
